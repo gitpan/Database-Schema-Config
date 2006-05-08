@@ -1,0 +1,213 @@
+NAME
+    Database::Schema::Config - Perl extension for storing generic config
+    strings with revision control in a table
+
+SYNOPSIS
+    This is an interface module to our database. All SQL queries should be
+    done at this level and only leave the actual config parsing to the upper
+    level modules.
+
+    *Note: All references to timestamp or date/time are usually stored as
+    Time::Timestamp objects, see Time::Timestamp for output options.
+
+DESCRIPTION
+    An API for storing and manipulating configuration files RCS-style using
+    a database backend. This allows the author to utilize any Config module
+    they wish (config::General, Config::Simple, etc...).
+
+SQL Table [mysql]
+      -- 
+      -- Table structure for table `config`
+      -- 
+
+      CREATE TABLE `config` (
+        `rev` int(11) NOT NULL auto_increment,
+        `xlock` tinyint(4) NOT NULL default '0',
+        `dt` int(11) NOT NULL default '0',
+        `user` varchar(32) NOT NULL default '',
+        `config` text NOT NULL,
+        `log` text,
+        PRIMARY KEY  (`rev`)
+      ) ENGINE=MyISAM DEFAULT CHARSET=latin1 AUTO_INCREMENT=2 ;
+
+OBJECT METHODS
+  new()
+    Constructor
+
+      my $cfg = Database::Schema::Config->new(
+            -dbh => $myDBI_handler,
+            -str => $configString,
+            -user => $user,
+            -table => 'myConfigTable',
+      );
+
+  listConfigs()
+    Fetch a listing of all of the stored configs. The listing will contain
+    the rev, timestamp, lock status, and user. If you want the log and
+    config, use getConfig().
+
+    Returns
+
+     (undef,HASHREF)        on success containing keys: "rev", "timestamp",
+                            "lock", "user". Each of those point to ARRAYREFs.
+     ('db failure',undef)   something failed with the DB
+
+    So the revision of the first config in the list (which should be the
+    oldest) is $hr->{'rev'}->[0]
+
+  isConfigLocked()
+    Check to see if the config is currently locked. If it is, return
+    information about the lock.
+
+      $cfg->isConfigLocked();
+
+    Returns
+
+      (undef,0)             not locked
+      (undef,HASHREF)       locked. see keys for details.
+      ('db failure',undef)  something failed with the DB
+
+  lockConfig()
+    Lock the configuration so other people know we are editting it. A note
+    will be appended to the "log" for the configuration. The latest
+    configuration will be "locked" unless "rev" is specified.
+
+     $cfg->lockConfig(-rev => $rev, -user => $username);
+
+    +rev
+        The revision to lock. Required. Pass in the revision of the
+        currently running config.
+
+    user
+        An identifier denoting who is locking the config. Required
+
+    Returns
+
+     (undef,1)                      on success
+     ('lock failed',0)              someone has it locked already. check the log by fetching
+                                    the config. See C<NetPass::DB::getConfig>
+     ('invalid parameters',undef)   the routine was called improperly
+     ('db failure',undef)           something failed with the DB
+
+  unlockConfig()
+    Unlock the configuration. Both parameters are required.
+
+     $cfg->unlockConfig(-rev => $rev, -user => $username);
+
+    Returns
+
+     (undef,1)                      on success
+     ('invalid parameters',undef)   the routine was called improperly
+     ('config not locked',0)        the config is not locked
+     ('db failure',undef)           something failed with the DB
+
+  appendLogToConfig()
+      $cfg->appendLogToConfig(-rev => rev, -user => username, -log => []);
+
+    Add a log entry to the given config revision.
+
+    Returns
+
+     (undef,1)                      on success
+     (undef,0)                      Revision doesn't exist
+     ('invalid parameters',undef)   the routine was called improperly
+     ('db failure',undef)           something failed with the DB
+
+  getConfig()
+    Fetch the specified configuration from the database. If "rev" is not
+    give, fetch the highest (latest) config from the database. If "lock" is
+    "1", place an advisory lock on the configuration so that other people
+    can't edit it without a warning.
+
+      $cfg->getConfig(-rev => integer, -user => $username, -lock => [0|1]);
+
+    +rev
+        An optional integer identifying which configuration to retrieve from
+        the database. Default is to fetch the latest.
+
+    user
+        This parameter is required of lock is "1".
+
+    lock
+         0 = get the config, I don't plan on editting it. (DEFAULT)
+         1 = get the config, I plan on editting it, so warning anyone else
+             who tries to edit the config.
+
+    Returns
+
+     (undef,HASHREF)        containing keys:
+                            {
+                                    'config'    => ARRAYREF,
+                                    'log'       => ARRAYREF,
+                                    'timestamp' => integer,
+                                    'rev'       => integer,
+                            '       user'      => scalar string
+                            }
+     ('lock failed',undef)  you said lock=1 but someone else already has a config locked for editting
+     ('db failure',undef)   something failed with the DB
+
+  putConfig()
+    Insert a new configuration file into the database ("config" table). It's
+    up to the calling application to "notice" the config rev was updated.
+
+     $cfg->putConfig(
+            -config => ARRAYREF,
+            -user => "username",
+            -log => ARRAYREF,
+            -autounlock => 0, # default is to unlock the config if isConfigLocked() == true
+     );
+
+    config
+        This is an array reference that contains the new configuration file
+        (string).
+
+    user
+        A username or identifier of the person who is importing the new
+        configuration.
+
+    log An optional array reference containing some text describing what
+        changes have been made.
+
+        Returns
+
+         (undef,1)                      on success.
+         ('db failure',undef)           something failed with the DB
+         ('invalid parameters',undef)   the routine was called improperly.
+
+  resetLocks()
+    This function resets all xLocks in the event that something screws up.
+
+     $cfg->resetLocks(
+            -rev => $rev, # defaults to $cfg->rev()
+     );
+
+  dbh()
+    Sets and returns the Database handle
+
+  table()
+    Sets and returns the base config table
+
+  string()
+    Sets and returns the config string
+
+  user()
+    Sets and returns the user
+
+  rev()
+    Sets and returns the rev
+
+SEE ALSO
+    Time::Timestamp
+
+    sourceforge://netpass
+
+AUTHOR'S
+    Original Author - Jeff Murphy - <jcmurphy@buffalo.edu>
+
+    Stolen By - Wes Young - <saxguard9-cpan@yahoo.com>
+
+LICENSE
+       (c) 2006 University at Buffalo.
+       Available under the "Artistic License"
+       http://www.gnu.org/licenses/license-list.html#ArtisticLicense
+
