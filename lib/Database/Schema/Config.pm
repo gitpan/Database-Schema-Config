@@ -3,10 +3,10 @@ package Database::Schema::Config;
 use 5.008007;
 use strict;
 use warnings;
-use Class::ParmList qw(simple_parms parse_parms);
+use Class::ParmList qw(parse_parms);
 use Time::Timestamp;
 
-our $VERSION = '.01';
+our $VERSION = '.02';
 use constant TABLE => 'config';
 
 =head1 NAME
@@ -52,6 +52,10 @@ Constructor
   	-table => 'myConfigTable',
   );
 
+Returns:
+
+  (undef,$obj) on success
+
 =cut
 
 sub new {
@@ -61,7 +65,7 @@ sub new {
 	my $self = {};
 	bless($self,$class);
 	$self->init(%parms);
-	return $self;
+	return (undef,$self);
 }
 
 # INIT
@@ -70,8 +74,6 @@ sub init {
 	my ($self,%parms) = @_;
 	$self->table(	$parms{-table});
 	$self->dbh(	$parms{-dbh});
-	$self->user(	$parms{-user});
-	$self->rev(	$parms{-rev});
 	$self->string(	$parms{-string});
 }
 
@@ -81,11 +83,10 @@ sub init {
 
 Fetch a listing of all of the stored configs. The listing will contain the rev, timestamp, lock status, and user. If you want the  log and config, use getConfig().
 
-Returns
+Returns:
 
- (undef,HASHREF)       	on success containing keys: "rev", "timestamp",
-                	"lock", "user". Each of those point to ARRAYREFs.
- ('db failure',undef)   something failed with the DB
+ (errstr,undef) something failed with the DB
+ (undef,HASHREF) on success containing keys: "rev", "timestamp","lock", "user". Each of those point to ARRAYREFs.
 
 So the revision of the first config in the list (which should be the oldest) is $hr->{'rev'}->[0]
 
@@ -110,15 +111,15 @@ sub listConfigs {
 
 =head2 isConfigLocked()
 
-Check to see if the config is currently locked. If it is, return information about the lock.
+Check to see if the latest config is currently locked. If it is, return information about the lock.
 
   $cfg->isConfigLocked();
 
 Returns
 
-  (undef,0)		not locked
-  (undef,HASHREF)	locked. see keys for details.
-  ('db failure',undef)	something failed with the DB
+  (errstr,undef) on failure
+  (undef,HASHREF) locked. see keys for details.
+  (undef,0) not locked
 
 =cut
 
@@ -128,11 +129,9 @@ sub isConfigLocked {
    	my $sql = 'SELECT rev, user FROM config WHERE xlock = 1';
     	my $rv  = $self->dbh->selectall_arrayref($sql);
 
-	return 'db failure: '.$self->dbh->errstr() unless(ref($rv) eq 'ARRAY');
-
-        $self->errstr('multiple locks on config detected.') unless($#{$rv} < 2);
-    	return (undef,0) if ($#{$rv} == -1);  # no locks
-
+	return ('db failure: '.$self->dbh->errstr(),undef) unless($rv);
+        return ('multiple locks on config detected.',undef) if(@$rv > 1);
+    	return ('config is not locked',0) if(@$rv == 0);  # no locks
     	return (undef,{
 		'rev'  => $rv->[0]->[0],
              	'user' => $rv->[0]->[1],
@@ -141,31 +140,20 @@ sub isConfigLocked {
 
 =head2 lockConfig()
 
-Lock the configuration so other people know we are editting it. A note
-will be appended to the "log" for the configuration.  The latest
-configuration will be "locked" unless "rev" is specified.
+Lock the configuration so other people know we are editting it. A note will be appended to the "log" for the configuration.  The latest configuration will be "locked" unless "rev" is specified. This should be called from the getConfig() method, not directly.
 
- $cfg->lockConfig(-rev => $rev, -user => $username);
+Accepts:
 
-=over 4
+  -rev => [int], defaults to 0
+  -user => [string],
 
-=item +rev
+  $cfg->lockConfig(-rev => $rev, -user => $username);
 
-The revision to lock. Required. Pass in the revision of the currently running config.
+Returns:
 
-=item user
-
-An identifier denoting who is locking the config. Required
-
-=back
-
-Returns
-
- (undef,1)             		on success
- ('lock failed',0)        	someone has it locked already. check the log by fetching
-                      		the config. See C<NetPass::DB::getConfig>
- ('invalid parameters',undef) 	the routine was called improperly
- ('db failure',undef)         	something failed with the DB
+  (errstr,undef) on failure
+  ('lock failed',0) if already locked
+  (undef,$rev) on success
 
 =cut
 
@@ -174,16 +162,16 @@ sub lockConfig {
 
     	my $parms = parse_parms({
 		-parms => \@_,
-		-required => [ qw(-rev -user) ],
+		-required => [qw(-rev -user)],
+		-legal => [qw(-lo)],
 		-defaults => {
-			   -rev    => $self->rev(),
-			   -user   => $self->user(),
+			-rev => 0,
 		}
 	});
 
-    	return ("invalid parameters\n".Carp::longmess (Class::ParmList->error()),undef) if (!defined($parms));
+    	return ("invalid parameters\n".Carp::longmess (Class::ParmList->error()),undef) unless(defined($parms));
 
-	my ($r, $u) = $parms->get('-rev', '-user');
+	my ($r,$u,$lo) = $parms->get('-rev','-user','-lo');
 
 	return ('invalid parameters (rev)',undef) unless($r >= 0);
 	return ('invalid parameters (user)',undef) unless($u ne '');
@@ -196,26 +184,31 @@ sub lockConfig {
 
 	return ('db failure: '.$self->dbh->errstr(),undef) unless(defined($rv));
 
-    	$self->appendLogToConfig(
+	my $err;
+    	($err,$rv) = $self->appendLogToConfig(
 		-rev => $r,
 		-user => $u,
-		-log => ['config locked']
+		-log => ['config locked'],
 	);
-    	return (undef,1);
+	return ($err,$rv) unless($rv);
+    	return (undef,$r);
 }
 
 =head2 unlockConfig()
 
-Unlock the configuration. Both parameters are required.
+Unlock the configuration. Both parameters are required. Should be called by the getConfig() method, not directly.
 
- $cfg->unlockConfig(-rev => $rev, -user => $username);
+Accepts:
 
-Returns
+  -rev => [int], defaults to 0
+  -user => [string],
 
- (undef,1)             		on success
- ('invalid parameters',undef) 	the routine was called improperly
- ('config not locked',0)	the config is not locked
- ('db failure',undef) 		something failed with the DB
+  $cfg->unlockConfig(-rev => $rev, -user => $username);
+
+Returns:
+
+  (errstr,undef) on failure
+  (undef,1) on success
 
 =cut
 
@@ -224,10 +217,9 @@ sub unlockConfig {
 
     	my $parms = parse_parms({
 		-parms => \@_,
-		-required => [ qw(-rev -user) ],
+		-required => [qw(-rev -user)],
 		-defaults => {
-			-user   => $self->user(),
-			-rev	=> $self->rev(),
+			-rev => 0,
 		}
 	});
 
@@ -238,14 +230,15 @@ sub unlockConfig {
 
 	return ('invalid parameters (rev)',undef) unless($r >= 0);
 	return ('invalid parameters (rev)',undef) unless(defined($u) && $u ne '');
-	return ('Config is not locked',0) unless($self->isConfigLocked() eq 'HASH');
+	my ($err,$rv) = $self->isConfigLocked();
+	return ($err,$rv) unless($rv);
 
-	my $rv = $self->appendLogToConfig(
+	($err,$rv) = $self->appendLogToConfig(
 		-rev => $r,
 		-user => $u,
 		-log => ['config unlocked'],
 	);
-    	return ($rv,undef) unless($rv);
+    	return ($err,$rv) unless($rv);
 
     	my $sql = 'UPDATE config SET xlock = 0 WHERE rev = '.$self->dbh->quote($r).' AND user = '.$self->dbh->quote($u);
     	$rv = $self->dbh->do($sql);
@@ -255,16 +248,21 @@ sub unlockConfig {
 
 =head2 appendLogToConfig()
 
-  $cfg->appendLogToConfig(-rev => rev, -user => username, -log => []);
+Accepts:
+
+  # required
+  -user => undef,
+  -rev => 0,
+  -log => [],
+
+  $cfg->appendLogToConfig(-rev => rev, -user => username, -log => ['myLogEntry']);
 
 Add a log entry to the given config revision.
 
 Returns
 
- (undef,1)             		on success
- (undef,0)			Revision doesn't exist
- ('invalid parameters',undef)	the routine was called improperly
- ('db failure',undef)		something failed with the DB
+  (errstr,undef) on failure
+  (undef,1) on success
 
 =cut
 
@@ -275,8 +273,7 @@ sub appendLogToConfig {
 		-parms => \@_,
 		-required => [ qw(-rev -user -log) ],
 		-defaults => {
-			-rev    => $self->rev(),
-			-user   => $self->user(),
+			-rev    => 0,
 			-log    => []
 		}
 	});
@@ -285,7 +282,7 @@ sub appendLogToConfig {
 
 	my ($r, $u, $l) = $parms->get('-rev', '-user', '-log');
 
-	return ('invalid parameters (rev)',undef) unless($r >= 0);
+	return ('invalid parameters (rev)',undef) unless($r > 0);
 	return ('invalid parameters (user)',undef) unless(defined($u) && $u ne '');
 	return ('log empty',0) unless((ref($l) eq 'ARRAY') && ($#{$l} >= 0)); #empty?
 
@@ -296,7 +293,7 @@ sub appendLogToConfig {
 
 	if ($#{$rv} == -1) {
 	    	# the revision didnt exist. we dont throw an error tho.
-	    	return ('revision doesnt exist',0);
+	    	return ('revision doesnt exist',undef);
     	}
 
 	$rv->[0]->[0] ||= '';
@@ -313,44 +310,31 @@ sub appendLogToConfig {
 
 =head2 getConfig()
 
-Fetch the specified configuration from the database. If "rev" is not
-give, fetch the highest (latest) config from the database. If "lock"
-is "1", place an advisory lock on the configuration so that other people
-can't edit it without a warning.
+Fetch the specified configuration from the database. If "rev" is not give, fetch the highest (latest) config from the database. If "lock" is "1", place an advisory lock on the configuration so that other people can't edit it without a warning.
 
   $cfg->getConfig(-rev => integer, -user => $username, -lock => [0|1]);
 
+Accepts:
 
-=over 4
+  # required
+  -rev => [int], defaults to 0
+  -user => [string],
 
-=item +rev
+  # legal
+  -lock => [0|1], default is 0 # lock for editing?
 
-An optional integer identifying which configuration to retrieve from the database. Default is to fetch the latest.
+Returns:
 
-=item user
+  (errstr,undef) on failure
+  (undef,HASHREF) containing keys:
 
-This parameter is required of lock is "1".
-
-=item lock
-
- 0 = get the config, I don't plan on editting it. (DEFAULT)
- 1 = get the config, I plan on editting it, so warning anyone else
-     who tries to edit the config.
-
-=back
-
-Returns
-
- (undef,HASHREF)       	containing keys:
-                  	{
-				'config'    => ARRAYREF,
-                    		'log'       => ARRAYREF,
-                    		'timestamp' => integer,
-                    		'rev'       => integer,
-                    	'	user'      => scalar string
-                  	}
- ('lock failed',undef)  you said lock=1 but someone else already has a config locked for editting
- ('db failure',undef)   something failed with the DB
+  	{
+  		'config'    => ARRAYREF,
+  		'log'       => ARRAYREF,
+  		'timestamp' => integer,
+  		'rev'       => integer,
+  		'user'      => scalar string
+  	}
 
 =cut
 
@@ -359,44 +343,46 @@ sub getConfig {
 
     	my $parms = parse_parms({
 		-parms => \@_,
-		-required => [ qw() ],
+		-required => [ qw(-rev -user) ],
+		-legal => [qw(-rev -user -lock)],
 		-defaults => {
-			-rev    => $self->rev(),
+			-rev    => 0,
+			-user 	=> '',
 			-lock   => 0,
-			-user   => $self->user(),
 		}
 	});
 
 	return ("invalid parameters\n".Carp::longmess (Class::ParmList->error()),undef) unless(defined($parms));
 
-    	my ($r, $l, $u) = $parms->get('-rev', '-lock', '-user');
-
-    	$r ||= 0;
+    	my ($r,$l,$u) = $parms->get('-rev','-lock','-user');
 
     	return ('invalid parameters (rev)',undef) unless($r >= 0);
     	return ('invalid parameters (lock)',undef) unless($l == 0 || $l == 1);
     	return ('invalid parameters (user)',undef) if(($l == 1) && ($u eq ''));
 
-	my $rv;
-    	if ($l) {
-	    	$rv = $self->lockConfig(-rev => $r, -user => $u);
-	    	return $rv unless($rv);
-    	}
-
-    	my $sql = 'SELECT config, log, dt AS timestamp, rev, user FROM config ';
+    	my $sql = 'SELECT rev,xlock,dt as Timestamp,user,config,log FROM `'.$self->table().'`';
     	$sql .= ' WHERE rev = '.$self->dbh->quote($r) if $r;
-    	$sql .= ' WHERE rev = (select MAX(rev) FROM config)' if ($r == 0);
+    	$sql .= ' WHERE rev = (select MAX(rev) FROM `'.$self->table().'`)' if ($r == 0);
 
+	my ($err,$rv);
     	$rv = $self->dbh->selectall_arrayref($sql);
 
     	return ('db failure '.$self->dbh->errstr(),undef) unless(ref($rv) eq 'ARRAY');
-	return ('db empty',undef) if($#{$rv} < 1);
+	return ('db empty',undef) unless($rv->[0]);
+
+    	if($l){
+		my $rv2;
+	    	($err,$rv2) = $self->lockConfig(-rev => $rv->[0]->[0], -user => $u);
+	    	return ($err,$rv2) unless($rv2);
+    	}
+	
     	return (undef,{
-		'config'    	=> [ split("\n", $rv->[0]->[0]) ],
-	      	'log'       	=> [ split("\n", $rv->[0]->[1]) ],
-	       	'timestamp' 	=> Time::Timestamp->new(ts => $rv->[0]->[2]),
-	       	'rev'       	=> $rv->[0]->[3],
-	       	'user'      	=> $rv->[0]->[4],
+		'rev'       	=> $rv->[0]->[0],
+		'xlock'		=> $rv->[0]->[1],
+		'timestamp' 	=> Time::Timestamp->new(ts => $rv->[0]->[2]),
+		'user'      	=> $rv->[0]->[3],
+		'config'    	=> [ split("\n", $rv->[0]->[4]) ],
+	      	'log'       	=> [ split("\n", $rv->[0]->[5]) ],
 	});
 }
 
@@ -404,34 +390,18 @@ sub getConfig {
 
 Insert a new configuration file into the database ("config" table). It's up to the calling application to "notice" the config rev was updated.
 
- $cfg->putConfig(
- 	-config => ARRAYREF,
- 	-user => "username",
- 	-log => ARRAYREF,
-	-autounlock => 0, # default is to unlock the config if isConfigLocked() == true
- );
-
-=over 4
-
-=item config
-
-This is an array reference that contains the new configuration file (string).
-
-=item user
-
-A username or identifier of the person who is importing the new configuration.
-
-=item log
-
-An optional array reference containing some text describing what changes have been made.
+  $cfg->putConfig(
+  	-config => ARRAYREF, # or ['string for array ref'] or [qw(my super cool string)]
+  	-user => [string],
+  	-log => ARRAYREF,
+  	-autounlock => [0|1], # default is to unlock the config if isConfigLocked() == true
+  	-init => [1|0], default is 0 # truncates the table and posts a blank config to rev 1. When you save, it becomes rev2
+  );
 
 Returns
 
- (undef,1)			on success.
- ('db failure',undef)		something failed with the DB
- ('invalid parameters',undef)  	the routine was called improperly.
-
-=back
+  (errstr,undef) on failure
+  (undef,1) on success
 
 =cut
 
@@ -441,31 +411,38 @@ sub putConfig {
 	my $parms = parse_parms({
 		-parms => \@_,
 		-required => [qw(-config -user)],
-		-legal => [qw(-config -user -lockOverride -autounlock)],
+		-legal => [qw(-config -user -autounlock -init)],
 		-defaults => {
-			-config    => [],
-			-user      => $self->user(),
-			-log       => [],
-			-lockOverride => 0,
+			-config => [],
+			-log => [],
 			-autounlock => 1,
+			-init => 0,
 		}
 	});
 
 	return ("invalid parameters\n".Carp::longmess (Class::ParmList->error()),undef) if (!defined($parms));
 
-	my ($c,$u,$l,$lo,$au) = $parms->get('-config','-user','-log','-lockOverride','-autounlock');
+	my ($c,$u,$l,$au,$i) = $parms->get('-config','-user','-log','-autounlock','-init');
 
 	return ('invalid parameters (config empty)',undef) unless(ref($c) eq 'ARRAY' && $#{$c} >= 0);
-	return ('invalid parameters (user empty)',undef) unless($u ne '');
-
-	my $hr = $self->isConfigLocked();
-	return ('no lock on previous config',undef) if(ref($hr) ne 'HASH' && $lo != 1);
- 	return ('Someone else has already locked this config: user='.$hr->{user}.' rev='.$hr->{rev},undef) if($self->user() ne $hr->{user});
+	return ('invalid parameters (user empty)',undef) if($u eq '');
+	my ($err,$rv,$rev);
+	if($i){
+		$rv = $self->dbh->do('DELETE FROM `'.$self->table().'`');
+		return ('db failure: '.$self->dbh->errstr(),undef) unless($rv);
+		$rv = $self->dbh->do('TRUNCATE TABLE `'.$self->table().'`');
+		return ('db failure: '.$self->dbh->errstr(),undef) unless($rv);
+	}
+	else {
+		my $hr = $self->isConfigLocked();
+		return ('no lock on previous config',undef) unless(ref($hr) eq 'HASH');
+		return ('Someone else has already locked this config: user='.$hr->{user}.' rev='.$hr->{rev},undef) if($hr->{user} ne $u);
+	}
 
 	my $ts = Time::Timestamp->new(ts => time());
-	my $sql = 'INSERT INTO `'.$self->table().'` (dt,user,config) VALUES (?,?,?)';
+	my $sql = 'INSERT INTO `'.$self->table().'` (rev,dt,user,config) VALUES (?,?,?,?)';
 	my $sth = $self->dbh->prepare($sql);
-	my $rv = $sth->execute($ts->epoch(),$u,@$c);
+	$rv = $sth->execute($rev,$ts->epoch(),$u,@$c);
 
 	return ('db failure: '.$self->dbh->errstr(),undef) unless($rv);
 
@@ -478,14 +455,16 @@ sub putConfig {
 	my @row = $sth->fetchrow_array();
 
 	# append initial message
-	my ($err,$rv2) = $self->appendLogToConfig(
+	my $rv2;
+	($err,$rv2) = $self->appendLogToConfig(
 		-rev 	=> $row[0],
 		-user	=> $u,
 		-log 	=> ['created'],
 	);
-	return ($err,$rv2) if(!$rv2);
+	return ($err,$rv2) if(!$rv2);	
 
-	$self->unlockConfig() unless(!$au || !$self->isConfigLocked());
+	($err,$rv) = $self->unlockConfig(-user => $u, -rev => ($row[0]-1)) unless(!$au || $i);
+	return ($err,$rv) unless($rv);
 
 	# append the users log message
 	($err,$rv) = $self->appendLogToConfig(
@@ -499,11 +478,16 @@ sub putConfig {
 
 =head2 resetLocks()
 
-This function resets all xLocks in the event that something screws up.
+This function resets the xLock in the event that something screws up.
 
- $cfg->resetLocks(
- 	-rev => $rev, # defaults to $cfg->rev()
- );
+Accepts:
+
+  -rev # optional, default is 'clear all locks'
+
+Returns:
+
+  (errstr,undef) on failure
+  (undef,1) on success
 
 =cut
 
@@ -513,15 +497,12 @@ sub resetLocks {
 	my $parms = parse_parms({
 		-parms => \@_,
 		-legal => [qw(-rev)],
-		-defaults => {
-			-rev => $self->rev(),
-		}
 	});
 
 	return ("invalid parameters\n".Carp::longmess (Class::ParmList->error()),undef) if (!defined($parms));
 	my ($rev) = $parms->get('-rev');
 
-	my $sql = 'UPDATE `'.$self->table().' SET xlock = 0';
+	my $sql = 'UPDATE `'.$self->table().'` SET xlock = 0';
 	$sql .= ' WHERE rev = '.$self->dbh->quote($rev) if($rev);
 
 	my $rv = $self->dbh->do($sql);
@@ -565,30 +546,6 @@ sub string {
 	my ($self,$v) = @_;
 	$self->{_string} = $v if(defined($v));
 	return $self->{_string};
-}
-
-=head2 user()
-
-Sets and returns the user
-
-=cut
-
-sub user {
-	my ($self,$v) = @_;
-	$self->{_user} = $v if(defined($v));
-	return $self->{_user};
-}
-
-=head2 rev()
-
-Sets and returns the rev
-
-=cut
-
-sub rev {
-	my ($self,$v) = @_;
-	$self->{_rev} = $v if(defined($v));
-	return $self->{_rev};
 }
 
 1;
